@@ -1,4 +1,2 @@
 # Dell
-# Dell
-# Dell
-# Dell
+
