@@ -139,27 +139,37 @@ document if a call is rejected as an unknown model:
 curl -s https://inference.local/v1/models
 ```
 
-### Two flags this deployment requires
+### The one flag this deployment requires
 
-Both defaults are wrong here, both failures were observed, and neither is
-guessable from the error text. Always pass them.
+**`--max-tokens 3000`.** The served model is a *reasoning* model. It emits its
+chain of thought into `reasoning_content` and only fills `content` after that
+finishes. On the default budget the whole allowance is consumed reasoning,
+`finish_reason` comes back `length`, `content` is empty, and the script reports
+`stage: "parse"`, `error: "unparseable after one repair attempt"`, `raw: ""`.
+**An empty `raw` on a parse error means the token budget was too small, not that
+the model misbehaved** — raise the budget rather than touching the parser.
 
-**`--workers 1`.** At the default worker count every single request fails with
-`HTTP 502: Ollama backend error: write EPIPE` or `read ECONNRESET`. Measured 20/20
-failures at the default, 0/3 at `--workers 1`, so pass it.
+### Concurrency: `--workers 4` is fine, and 2.6x faster
 
-**But do not assume concurrency is the cause.** The served vLLM instance has been
-observed crashing outright — `EngineDeadError`, from
-`torch.AcceleratorError: CUDA error: an illegal instruction was encountered`
-during CUDA graph capture — which resets every in-flight connection and produces
-*exactly the same* `EPIPE`/`ECONNRESET` wall. It self-restarts, but takes 3-4
-minutes to reload the model, and is unreachable throughout.
+An earlier version of this document demanded `--workers 1`, on the strength of a
+wall of `HTTP 502 ... write EPIPE` / `read ECONNRESET` at the default worker
+count. **That conclusion was wrong.** The measurement was taken while the vLLM
+engine was repeatedly crashing (`EngineDeadError` from
+`torch.AcceleratorError: CUDA error: an illegal instruction was encountered`),
+which resets every in-flight connection and produces exactly that wall. The
+proxy was never the problem; serializing merely made the crash rarer.
 
-So **always curl `/v1/models` once before changing any flag.** If that single
-request also fails, the backend is down: wait for it, because no worker count
-will help. If it returns 200 while the sweep fails, then it is load-related and
-`--workers 1` is the answer. Diagnosing this backwards costs 4 minutes minimum
-and can look like a script bug for much longer.
+With the server running `--enforce-eager` the engine is stable and concurrency
+is safe. Measured on the same candidate set: **32.5 s/candidate at `--workers 1`,
+12.3 s/candidate at `--workers 4`**, with zero `stage: request` errors and no
+engine restarts. Use `--workers 4`.
+
+**The general lesson, which is what to actually remember:** a wall of connection
+errors is a symptom shared by two unrelated causes — a dead backend and genuine
+overload — and they call for opposite responses. **Always send one `curl` to
+`/v1/models` before changing any flag.** If that single request also fails, the
+backend is down: wait, because no worker count helps. Only if it returns 200
+while the sweep fails is the problem load-related.
 
 **`--max-tokens 3000`.** The served model is a *reasoning* model. It emits its
 chain of thought into `reasoning_content` and only fills `content` after that
@@ -197,14 +207,15 @@ between calls.
     --input out/chunks.jsonl --output out/candidates.jsonl
 
 # 3. Model sweep. One call per candidate. Add --limit 20 for a smoke run first.
-#    --workers 1 and --max-tokens 3000 are REQUIRED; see above.
-#    Budget ~25s per candidate at one worker.
+#    --max-tokens 3000 is REQUIRED; see above. Budget ~12s per candidate at
+#    --workers 4. If the endpoint is a different deployment, drop to --workers 1
+#    until you have confirmed concurrency is safe there.
 /sandbox/.venv-diligence/bin/python \
     /sandbox/.hermes/skills/dataroom-diligence/scripts/sweep.py \
     --candidates out/candidates.jsonl \
     --endpoint https://inference.local/v1 \
     --model /models/nemotron-nano-nvfp4 \
-    --workers 1 --max-tokens 3000 \
+    --workers 4 --max-tokens 3000 \
     --output out/findings.jsonl --errors out/sweep-errors.jsonl
 
 # 4. GATE. Verify every quote against source text. Nothing is reportable until
@@ -217,10 +228,17 @@ between calls.
 ```
 
 **Always smoke-test first on a large data room.** Run step 3 with `--limit 20`,
-carry it through step 4, and only then start the full sweep. At the mandatory
-`--workers 1` each candidate is one serial model call of roughly 25 seconds, so
-20 candidates is about 8 minutes and a few hundred is an hour or more. Tell the
-user the expected wall-clock before starting a full sweep.
+carry it through step 4, and only then start the full sweep. At `--workers 4`
+budget roughly 12 seconds per candidate, so 20 candidates is about 4 minutes and
+150 candidates is half an hour. Tell the user the expected wall-clock before
+starting a full sweep.
+
+**`sweep.py` writes `findings.jsonl` only when it finishes.** A crash at minute
+50 of an hour-long sweep therefore yields *nothing* — and an absent
+`findings.jsonl` with an absent `sweep-errors.jsonl` is that signature, not a
+zero-findings result. On a corpus large enough for this to hurt, sweep in
+`--limit` batches to separate output files and concatenate them, so one failure
+costs one batch.
 
 Rules for Phase 1:
 
@@ -299,7 +317,8 @@ this deployment, and in every case the obvious reading of the error was wrong.
 | Symptom | Diagnosis | Action |
 |---|---|---|
 | `502` / `write EPIPE` / `read ECONNRESET`, **and** one `curl` to `/v1/models` also fails | the backend is **down or restarting** | wait and re-curl until it returns 200 — vLLM needs ~3-4 minutes to reload. Lowering `--workers` cannot help and wastes the wait |
-| `502` / `write EPIPE` / `read ECONNRESET`, **but** one `curl` returns 200 | load-related: the engine or proxy fails under this script's concurrency | re-run at `--workers 1` |
+| `502` / `write EPIPE` / `read ECONNRESET`, **but** one `curl` returns 200 | load-related: the engine or proxy fails under this concurrency | re-run at `--workers 1`; report that concurrency had to be reduced, since on this deployment it should not be necessary |
+| Errors are `stage: schema`, `quote_not_in_source` | **not a failure.** The model's quote was not verbatim in the chunk and `sweep.py` rejected it | none — this is the citation gate working upstream of `validate.py` |
 | No `findings.jsonl` **and** no `sweep-errors.jsonl` at all | `sweep.py` died before it could write either file — almost always a dead endpoint at startup | curl the endpoint; this absence is the diagnostic, do not read it as "zero findings" |
 | Every sweep error is `stage: parse` with `raw: ""` | token budget consumed by `reasoning_content` | raise `--max-tokens` (3000 works); do not touch the parser |
 | `sweep.py` hangs silently until timeout | network, not the model | check the endpoint line it printed: `http://` on `inference.local`, a hardcoded `localhost`, an overridden proxy |

@@ -112,16 +112,31 @@ seconds, so a few hundred candidates is an hour or more.
 
 Learned the hard way; none are guessable from the error text.
 
-- **`--workers 1`** — concurrent requests can return
-  `HTTP 502 ... write EPIPE` / `read ECONNRESET`.
 - **`--max-tokens 3000`** — with a *reasoning* model the whole budget goes into
   `reasoning_content` first, so a small budget yields empty `content` and a
   misleading `stage: parse` error with `raw: ""`. Raise the budget; don't touch
   the parser.
 - **A wall of `502`/`ECONNRESET` does not prove a concurrency problem.** A
-  backend that is down or restarting produces identical errors. Always send one
+  backend that is down or crashing produces identical errors. Always send one
   `curl` to `/v1/models` before changing any flag — if that also fails, wait,
-  because no worker count will help.
+  because no worker count will help. This bit us hard: a `--workers 1`
+  requirement was documented on the strength of such a wall, when the real cause
+  was the vLLM engine crashing (`EngineDeadError` from
+  `torch.AcceleratorError: CUDA error: an illegal instruction was encountered`).
+  Serializing made the crash rarer, not absent.
+- **Serve with `--enforce-eager` on GB10 / DGX Spark.** With this image's
+  FlashInfer + FP4 kernel stack, CUDA graphs produced illegal-instruction faults
+  both at capture time and during requests. Eager mode costs ~25% throughput and
+  is stable. Measured after the switch: 32.5 s/candidate at `--workers 1` versus
+  **12.3 s/candidate at `--workers 4`**, with no engine restarts — so concurrency
+  is fine once the server is stable.
+- **`sweep.py` writes its output only on completion.** A crash mid-run yields
+  nothing, and an absent `findings.jsonl` *together with* an absent
+  `sweep-errors.jsonl` is that signature rather than a zero-findings result. On a
+  large corpus, sweep in `--limit` batches.
+- **`stage: schema` / `quote_not_in_source` errors are not failures.** They are
+  `sweep.py` rejecting a quote the model did not reproduce verbatim — the
+  citation gate working one stage upstream of `validate.py`.
 - **`terms` is a hint, not a lookup key.** `CLAUSE_TERMS` in `schemas.py` is
   documented and injected into the prompt, but nothing enforces it — one measured
   run produced 4 populated term values across 13 findings, under invented names.
