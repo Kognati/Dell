@@ -1,0 +1,26 @@
+# dataroom-diligence runtime dependencies.
+#
+# Four things total: three packages plus the standard library. Every addition is
+# another aarch64 wheel to pre-stage inside an egress-denied sandbox, so resist
+# adding a fourth. csv/json/re/dataclasses cover the rest.
+#
+# Versions are pinned because the skill is authored on one architecture and run
+# on another (aarch64). Do NOT vendor wheels or commit a virtualenv into this
+# directory -- build the wheelhouse on the target machine, or download
+# aarch64-tagged wheels for it:
+#
+#   pip download -r requirements.txt \
+#       --only-binary=:all: --platform manylinux2014_aarch64 \
+#       --python-version 3.11 -d /path/to/wheelhouse
+#
+# Then, once, on the target before the skill runs:
+#
+#   pip install --no-index --find-links /path/to/wheelhouse -r requirements.txt
+#
+# The wheelhouse must also contain the transitive dependencies pip resolves
+# (httpcore, h11, anyio, sniffio, certifi, idna, et-xmlfile). `pip download`
+# collects them; a hand-assembled wheelhouse will not.
+
+pymupdf==1.24.14
+httpx==0.27.2
+openpyxl==3.1.5
